@@ -30,6 +30,8 @@ Lastly, test the model:
 ollama run my-model
 ```
 
+Safetensors weights that were already quantized with MLX run on the MLX engine as they are, at any MLX affine bit width: 1, 2, 3, 4, 5, 6 or 8 bits. Mixture-of-experts models other than Gemma 4 need their experts at 4 or 8 bits. Quantizing a model during `ollama create` with `--quantize` supports `int4`, `int8`, `nvfp4`, `mxfp4` and `mxfp8`.
+
 ## Importing a GGUF model
 
 Ollama does not quantize GGUF models during import. Prepare and quantize them first with a GGUF tool such as llama.cpp's [`llama-quantize`](https://github.com/ggml-org/llama.cpp/tree/master/tools/quantize).
