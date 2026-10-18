@@ -2,6 +2,8 @@ package create
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/ollama/ollama/mlx/quant"
@@ -82,15 +84,19 @@ func Classify(inv Inventory, requested string) (Classification, error) {
 
 // detectPrequantizedQuantization reports a single quantization shared by the
 // source's recognized prequantized weights. A mixed or unrecognized source has
-// no single file type to record in the model manifest.
+// no single file type to record in the model manifest. Per-module entries do
+// not make a source mixed: like a GGUF file type, the default they vary names
+// the model's quantization, unless no weight keeps it, as in mlx-lm's mixed
+// recipes. Then the most common type among the weights names it.
 func detectPrequantizedQuantization(inv Inventory) string {
 	var detected string
+	counts := make(map[string]int)
 	for _, name := range sortedTensorNames(inv) {
-		spec, _, ok := matchPrequant(name, inv)
+		p, base, ok := findPrequant(name, inv)
 		if !ok {
 			continue
 		}
-		q := quant.Canonical(spec.Metadata["quant_type"])
+		q := quant.Canonical(prequantMetadata(inv, p)["quant_type"])
 		if q == "" {
 			continue
 		}
@@ -98,8 +104,23 @@ func detectPrequantizedQuantization(inv Inventory) string {
 			return ""
 		}
 		detected = q
+		resolved := q
+		if m, ok := moduleEntry(inv, p, base); ok {
+			resolved, _ = m.settings()
+		}
+		counts[resolved]++
 	}
-	return detected
+	if detected == "" || counts[detected] > 0 {
+		return detected
+	}
+	var common string
+	most := 0
+	for _, t := range slices.Sorted(maps.Keys(counts)) {
+		if t != "" && counts[t] > most {
+			common, most = t, counts[t]
+		}
+	}
+	return common
 }
 
 // normalizeRequested validates the user's quantize value and returns its

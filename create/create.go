@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -348,48 +347,6 @@ func (q *sourceQuantization) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// mixedPrecision reports whether any per-module entry quantizes its module
-// differently from the default. QuantMetadata calls it for every weight, so it
-// stops at the first such entry.
-func (q sourceQuantization) mixedPrecision() bool {
-	for _, m := range q.Modules {
-		if q.overrides(m) {
-			return true
-		}
-	}
-	return false
-}
-
-// firstMixedModule returns, in path order, the first module whose entry
-// quantizes it differently from the default, or "" if none does.
-func (q sourceQuantization) firstMixedModule() string {
-	for _, path := range slices.Sorted(maps.Keys(q.Modules)) {
-		if q.overrides(q.Modules[path]) {
-			return path
-		}
-	}
-	return ""
-}
-
-// overrides reports whether m quantizes its module differently from the
-// default. An entry that restates the default field for field needs no
-// resolving.
-func (q sourceQuantization) overrides(m moduleQuantization) bool {
-	defaults := q.defaults()
-	if m == defaults {
-		return false
-	}
-	quantType, groupSize := m.settings()
-	wantType, wantGroupSize := defaults.settings()
-	return quantType != wantType || groupSize != wantGroupSize
-}
-
-// defaults returns the entry that restates the config's default quantization,
-// which MLX gives modules without an entry.
-func (q sourceQuantization) defaults() moduleQuantization {
-	return moduleQuantization{Bits: q.Bits, GroupSize: q.GroupSize, Mode: q.Mode}
-}
-
 // settings returns the quantization type and group size MLX gives the module,
 // with "" for a type the engine does not recognize.
 func (m moduleQuantization) settings() (quantType string, groupSize int) {
@@ -489,15 +446,6 @@ func (cfg sourceModelConfig) QuantMetadata() map[string]string {
 	q := cfg.declaredQuantization()
 	quantType := q.quantType()
 	if quantType == "" {
-		return nil
-	}
-	// The loader trusts the recorded type over tensor shapes, so recording the
-	// default would mislabel modules whose entries differ from it. Such a config
-	// without a mode records nothing, and the loader infers each weight from its
-	// shapes as it always has; checkModuleQuantization refuses the ones whose
-	// layouts it can't read that way. Configs that state a mode still record the
-	// default, pending support for per-module entries.
-	if q.Mode == "" && q.mixedPrecision() {
 		return nil
 	}
 

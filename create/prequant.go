@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -40,6 +41,7 @@ type prequantPattern struct {
 
 	forceQuantType   string // override the blob's quant_type metadata
 	defaultGroupSize string // set group_size metadata only when the config did not
+	moduleEntries    bool   // honor config.json's mlx-lm per-module entries
 }
 
 // prequantPatterns is consulted in order; the first whose weight suffix matches
@@ -48,10 +50,11 @@ type prequantPattern struct {
 // are mutually exclusive, so the order between them does not matter.
 var prequantPatterns = []prequantPattern{
 	{
-		name:         "mlx",
-		weightSuffix: ".weight",
-		scaleSuffix:  ".scales",
-		biasSuffix:   ".biases",
+		name:          "mlx",
+		weightSuffix:  ".weight",
+		scaleSuffix:   ".scales",
+		biasSuffix:    ".biases",
+		moduleEntries: true,
 	},
 	{
 		name:             "compressed-tensors-nvfp4",
@@ -93,7 +96,7 @@ var prequantPatterns = []prequantPattern{
 // and any remaining tensors (norms, embeddings) pass through at source
 // precision.
 func planPrequantized(inv Inventory) ([]BlobSpec, error) {
-	if err := checkModuleQuantization(inv); err != nil {
+	if err := checkModuleTypes(inv); err != nil {
 		return nil, err
 	}
 	fused := make(map[string]BlobSpec)
@@ -255,11 +258,10 @@ func planPrequantExpertGroup(group string, weights []SourceTensor, fused map[str
 	return specs, nil
 }
 
-// matchPrequant returns the fused blob for a weight tensor if it matches a
-// prequantized producer, along with the source names it consumes. It returns
-// ok=false when name is not a prequantized weight (a companion or a plain
-// tensor).
-func matchPrequant(name string, inv Inventory) (BlobSpec, []string, bool) {
+// findPrequant returns the prequantized producer pattern a weight tensor
+// matches and the weight's base name. It returns ok=false when name is not a
+// prequantized weight (a companion or a plain tensor).
+func findPrequant(name string, inv Inventory) (prequantPattern, string, bool) {
 	for _, p := range prequantPatterns {
 		base, ok := strings.CutSuffix(name, p.weightSuffix)
 		if !ok {
@@ -269,101 +271,81 @@ func matchPrequant(name string, inv Inventory) (BlobSpec, []string, bool) {
 		if !inv.Has(scaleSrc) {
 			continue
 		}
-		weight := inv.Tensors[name]
-		scale := inv.Tensors[scaleSrc]
-		if !matchesDtype(weight.Dtype, p.weightDtypes) || !matchesDtype(scale.Dtype, p.scaleDtypes) {
-			continue
+		if matchesDtype(inv.Tensors[name].Dtype, p.weightDtypes) && matchesDtype(inv.Tensors[scaleSrc].Dtype, p.scaleDtypes) {
+			return p, base, true
 		}
-
-		outWeight := base + ".weight"
-		var tensors []TensorSpec
-		var consumed []string
-
-		weightTensor := TensorSpec{Name: outWeight, Sources: []SourceTensor{weight}}
-		if p.repackWeight && len(weight.Shape) == 2 && (strings.EqualFold(weight.Dtype, "U8") || isE4M3Dtype(weight.Dtype)) {
-			weightTensor.Transform = TransformRepackFP4
-			if isE4M3Dtype(weight.Dtype) {
-				weightTensor.Transform = TransformRepackFP8
-			}
-			weightTensor.OutDtype = "U32"
-			weightTensor.OutShape = []int32{weight.Shape[0], weight.Shape[1] / 4}
-		}
-		tensors = append(tensors, weightTensor)
-
-		scaleTensor := TensorSpec{Name: outWeight + ".scale", Sources: []SourceTensor{scale}}
-		if p.scaleRelabelU8 && isE4M3Dtype(scale.Dtype) {
-			scaleTensor.Transform = TransformRelabelU8
-			scaleTensor.OutDtype = "U8"
-		}
-		tensors = append(tensors, scaleTensor)
-		consumed = append(consumed, scaleSrc)
-
-		if p.biasSuffix != "" {
-			if biasSrc := base + p.biasSuffix; inv.Has(biasSrc) {
-				tensors = append(tensors, TensorSpec{Name: outWeight + ".bias", Sources: []SourceTensor{inv.Tensors[biasSrc]}})
-				consumed = append(consumed, biasSrc)
-			}
-		}
-
-		if p.globalSuffix != "" {
-			if gSrc := base + p.globalSuffix; inv.Has(gSrc) {
-				globalSource := inv.Tensors[gSrc]
-				global := TensorSpec{Name: outWeight + ".global_scale", Sources: []SourceTensor{globalSource}, Transform: f32ScaleTransform(globalSource)}
-				if p.globalReciprocal {
-					global.Transform = TransformReciprocalF32
-				}
-				tensors = append(tensors, global)
-				consumed = append(consumed, gSrc)
-			}
-		}
-
-		for _, suffix := range p.ignoreSuffixes {
-			if source := base + suffix; inv.Has(source) {
-				consumed = append(consumed, source)
-			}
-		}
-
-		return BlobSpec{Name: outWeight, Tensors: tensors, Metadata: prequantMetadata(inv, p)}, consumed, true
 	}
-	return BlobSpec{}, nil, false
+	return prequantPattern{}, "", false
 }
 
-// checkModuleQuantization rejects an int4 or int8 config without a mode whose
-// per-module entries quantize some modules differently from the default,
-// unless the loader reads every weight correctly from its tensor shapes. Such
-// a config records no type (see QuantMetadata), and shapes identify only some
-// layouts; the loader would fail to load the others or load them at the wrong
-// width.
-func checkModuleQuantization(inv Inventory) error {
-	q := inv.Config.declaredQuantization()
-	if q.Mode != "" || q.quantType() == "" || !q.mixedPrecision() {
-		return nil
+// matchPrequant returns the fused blob for a weight tensor if it matches a
+// prequantized producer, along with the source names it consumes. It returns
+// ok=false when name is not a prequantized weight (a companion or a plain
+// tensor).
+func matchPrequant(name string, inv Inventory) (BlobSpec, []string, bool) {
+	p, base, ok := findPrequant(name, inv)
+	if !ok {
+		return BlobSpec{}, nil, false
 	}
-	wantType, wantGroupSize := q.defaults().settings()
-	for _, name := range sortedTensorNames(inv) {
-		spec, _, ok := matchPrequant(name, inv)
-		if !ok {
-			continue
+	scaleSrc := base + p.scaleSuffix
+	weight := inv.Tensors[name]
+	scale := inv.Tensors[scaleSrc]
+
+	outWeight := base + ".weight"
+	var tensors []TensorSpec
+	var consumed []string
+
+	weightTensor := TensorSpec{Name: outWeight, Sources: []SourceTensor{weight}}
+	if p.repackWeight && len(weight.Shape) == 2 && (strings.EqualFold(weight.Dtype, "U8") || isE4M3Dtype(weight.Dtype)) {
+		weightTensor.Transform = TransformRepackFP4
+		if isE4M3Dtype(weight.Dtype) {
+			weightTensor.Transform = TransformRepackFP8
 		}
-		path := strings.TrimSuffix(spec.Name, ".weight")
-		quantType, groupSize := wantType, wantGroupSize
-		if m, ok := q.Modules[path]; ok {
-			if err := checkModuleEntry(path, m); err != nil {
-				return err
+		weightTensor.OutDtype = "U32"
+		weightTensor.OutShape = []int32{weight.Shape[0], weight.Shape[1] / 4}
+	}
+	tensors = append(tensors, weightTensor)
+
+	scaleTensor := TensorSpec{Name: outWeight + ".scale", Sources: []SourceTensor{scale}}
+	if p.scaleRelabelU8 && isE4M3Dtype(scale.Dtype) {
+		scaleTensor.Transform = TransformRelabelU8
+		scaleTensor.OutDtype = "U8"
+	}
+	tensors = append(tensors, scaleTensor)
+	consumed = append(consumed, scaleSrc)
+
+	if p.biasSuffix != "" {
+		if biasSrc := base + p.biasSuffix; inv.Has(biasSrc) {
+			tensors = append(tensors, TensorSpec{Name: outWeight + ".bias", Sources: []SourceTensor{inv.Tensors[biasSrc]}})
+			consumed = append(consumed, biasSrc)
+		}
+	}
+
+	if p.globalSuffix != "" {
+		if gSrc := base + p.globalSuffix; inv.Has(gSrc) {
+			globalSource := inv.Tensors[gSrc]
+			global := TensorSpec{Name: outWeight + ".global_scale", Sources: []SourceTensor{globalSource}, Transform: f32ScaleTransform(globalSource)}
+			if p.globalReciprocal {
+				global.Transform = TransformReciprocalF32
 			}
-			quantType, groupSize = m.settings()
+			tensors = append(tensors, global)
+			consumed = append(consumed, gSrc)
 		}
-		if inferableFromShapes(quantType, groupSize) {
-			continue
-		}
-		if quantType == wantType && groupSize == wantGroupSize {
-			return fmt.Errorf("%s: config.json quantizes this module as %s with group size %d and %s differently; mixed-precision checkpoints are not supported yet",
-				path, quantType, groupSize, q.firstMixedModule())
-		}
-		return fmt.Errorf("%s: config.json quantizes this module as %s with group size %d, unlike the model's %s with group size %d; mixed-precision checkpoints are not supported yet",
-			path, quantType, groupSize, wantType, wantGroupSize)
 	}
-	return nil
+
+	for _, suffix := range p.ignoreSuffixes {
+		if source := base + suffix; inv.Has(source) {
+			consumed = append(consumed, source)
+		}
+	}
+
+	md := prequantMetadata(inv, p)
+	// checkModuleTypes has refused entries that resolve to no type.
+	if m, ok := moduleEntry(inv, p, base); ok {
+		quantType, groupSize := m.settings()
+		md = map[string]string{"quant_type": quantType, "group_size": strconv.Itoa(groupSize)}
+	}
+	return BlobSpec{Name: outWeight, Tensors: tensors, Metadata: md}, consumed, true
 }
 
 // checkModuleEntry rejects a per-module entry whose settings can't be read or
@@ -382,21 +364,6 @@ func checkModuleEntry(path string, m moduleQuantization) error {
 		return fmt.Errorf("%s: config.json quantizes this module with %s, which is not supported", path, setting)
 	}
 	return nil
-}
-
-// inferableFromShapes reports whether the loader, given no metadata, reads a
-// weight quantized as quantType with groupSize correctly from its tensor
-// shapes. Packing fixes only bits × group size, which the loader resolves to
-// int4 at group size 16 or 32 and int8 at 64 or 128. It can't place int4/64
-// or int8/32, and it misreads int4/128 and int8/16.
-func inferableFromShapes(quantType string, groupSize int) bool {
-	switch quantType {
-	case "int4":
-		return groupSize == 16 || groupSize == 32
-	case "int8":
-		return groupSize == 64 || groupSize == 128
-	}
-	return false
 }
 
 func f32ScaleTransform(t SourceTensor) Transform {
@@ -418,6 +385,46 @@ func matchesDtype(dtype string, allowed []string) bool {
 		}
 	}
 	return false
+}
+
+// moduleEntries returns config.json's mlx-lm per-module entries, keyed by
+// module path. They apply only when the default quantization names an MLX
+// type.
+func (cfg sourceModelConfig) moduleEntries() map[string]moduleQuantization {
+	q := cfg.declaredQuantization()
+	if q.quantType() == "" {
+		return nil
+	}
+	return q.Modules
+}
+
+// moduleEntry returns the per-module entry for the fused weight at base, if its
+// producer honors entries. mlx-lm names each entry for the module whose weight
+// is base+".weight".
+func moduleEntry(inv Inventory, p prequantPattern, base string) (moduleQuantization, bool) {
+	if !p.moduleEntries {
+		return moduleQuantization{}, false
+	}
+	m, ok := inv.Config.moduleEntries()[base]
+	return m, ok
+}
+
+// checkModuleTypes rejects per-module entries at a type the engine cannot
+// load, or whose settings can't be read. It checks only the entries that apply
+// to a weight; matchPrequant records them.
+func checkModuleTypes(inv Inventory) error {
+	for _, name := range sortedTensorNames(inv) {
+		p, base, ok := findPrequant(name, inv)
+		if !ok {
+			continue
+		}
+		if m, ok := moduleEntry(inv, p, base); ok {
+			if err := checkModuleEntry(base, m); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // prequantMetadata builds the fused blob's metadata: the source config's quant
