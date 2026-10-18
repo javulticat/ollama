@@ -2,6 +2,7 @@ package mlx
 
 import (
 	"math"
+	"math/bits"
 	"testing"
 
 	"github.com/ollama/ollama/mlx/mlxthread/mlxthreadtest"
@@ -19,6 +20,40 @@ func mlxForm(checkpoint []float32) []float32 {
 
 // fp4Values decodes an fp4 (E2M1) code to its value.
 var fp4Values = [16]float32{0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6}
+
+// TestHadamardTransform checks the transform against an explicit Sylvester
+// Hadamard matrix, H[i][j] = (-1)^popcount(i&j), applied to each row.
+func TestHadamardTransform(t *testing.T) {
+	withMLXThread(t, func(t *mlxthreadtest.T) {
+		const rows, n = 3, 16
+		scale := float32(1 / math.Sqrt(n))
+
+		h := make([]float32, n*n)
+		for i := range n {
+			for j := range n {
+				h[i*n+j] = scale
+				if bits.OnesCount(uint(i&j))%2 == 1 {
+					h[i*n+j] = -scale
+				}
+			}
+		}
+		xValues := make([]float32, rows*n)
+		for i := range xValues {
+			xValues[i] = float32(i%11-5) / 4
+		}
+		x := FromValues(xValues, rows, n)
+
+		got := HadamardTransform(x, scale)
+		want := Matmul(x, FromValues(h, n, n))
+		if err := requireClose("hadamard", got, want, 1e-5); err != nil {
+			t.Fatal(err)
+		}
+		// The normalized transform is its own inverse.
+		if err := requireClose("hadamard twice", HadamardTransform(got, scale), x, 1e-5); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
 
 func TestDequantizeGlobalScale(t *testing.T) {
 	withMLXThread(t, func(t *mlxthreadtest.T) {

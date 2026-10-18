@@ -38,6 +38,16 @@ var scaleAndCast = Compile2(
 	Shapeless(),
 )
 
+// HadamardTransform applies the Walsh-Hadamard transform along the last axis
+// and multiplies the result by scale; 1/sqrt(n) makes it orthonormal. MLX
+// requires the last dimension to be m*2^k with m in {1, 12, 20, 28}.
+func HadamardTransform(a *Array, scale float32) *Array {
+	optScale := C.mlx_optional_float{value: C.float(scale), has_value: true}
+	out := New("HADAMARD_TRANSFORM")
+	mlxCheck(C.mlx_hadamard_transform(&out.ctx, a.ctx, optScale, DefaultStream().ctx))
+	return out
+}
+
 // Quantization operations
 
 func Quantize(w *Array, groupSize, bits int, mode string) (weights, scales, biases *Array) {
