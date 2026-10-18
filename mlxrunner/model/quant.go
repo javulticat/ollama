@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -94,6 +96,19 @@ func readBlobTensorQuantInfo(path string) (map[string]*TensorQuantInfo, string, 
 	}
 
 	return infos, globalQuantType, globalGroupSize, nil
+}
+
+// checkCUDAQuant rejects weights quantized to a type MLX's CUDA backend has no
+// kernels for. Its quantized matmul panics on them, and its dequantize returns
+// garbage without an error, which embeddings and runtimes that dequantize at
+// load would use silently.
+func checkCUDAQuant(infos map[string]*TensorQuantInfo) error {
+	for _, name := range slices.Sorted(maps.Keys(infos)) {
+		if quantType := infos[name].QuantType; !quant.SupportedOnCUDA(quantType) {
+			return fmt.Errorf("%s: %s weights are not supported on CUDA", name, quant.Canonical(quantType))
+		}
+	}
+	return nil
 }
 
 func parseGlobalQuantMetadata(header map[string]json.RawMessage) (quantType string, groupSize int) {

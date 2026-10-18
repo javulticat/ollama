@@ -14,6 +14,9 @@ type params struct {
 	// requestable marks the types the importer can quantize to. The rest are
 	// only recognized in already-quantized sources.
 	requestable bool
+	// noCUDA marks the types MLX's CUDA backend has no quantized matmul or
+	// dequantize kernels for.
+	noCUDA bool
 }
 
 // byType maps each canonical quantization type to its parameters. Aliases are
@@ -23,7 +26,7 @@ var byType = map[string]params{
 	"nvfp4": {groupSize: 16, bits: 4, mode: "nvfp4", requestable: true},
 	"mxfp4": {groupSize: 32, bits: 4, mode: "mxfp4", requestable: true},
 	"mxfp8": {groupSize: 32, bits: 8, mode: "mxfp8", requestable: true},
-	"int1":  {groupSize: 64, bits: 1, mode: "affine"},
+	"int1":  {groupSize: 64, bits: 1, mode: "affine", noCUDA: true},
 	"int2":  {groupSize: 64, bits: 2, mode: "affine"},
 	"int3":  {groupSize: 64, bits: 3, mode: "affine"},
 	"int4":  {groupSize: 64, bits: 4, mode: "affine", requestable: true},
@@ -61,6 +64,12 @@ func Canonical(quantType string) string {
 // for quantizing a model during create.
 func Requestable(quantType string) bool {
 	return byType[Canonical(quantType)].requestable
+}
+
+// SupportedOnCUDA reports whether MLX's CUDA backend can multiply weights of
+// quantType. Unrecognized types report true and are left to the loader.
+func SupportedOnCUDA(quantType string) bool {
+	return !byType[Canonical(quantType)].noCUDA
 }
 
 // Params returns the default group size, bit width, and mode for a

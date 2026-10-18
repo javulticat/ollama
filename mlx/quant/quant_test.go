@@ -67,6 +67,19 @@ func TestCanonicalAndRequestable(t *testing.T) {
 	}
 }
 
+func TestSupportedOnCUDA(t *testing.T) {
+	for _, quantType := range []string{"int2", "int3", "int4", "int5", "int6", "int8", "nvfp4", "mxfp4", "mxfp8", "", "something-else"} {
+		if !SupportedOnCUDA(quantType) {
+			t.Errorf("SupportedOnCUDA(%q) = false, want true", quantType)
+		}
+	}
+	for _, quantType := range []string{"int1", "INT1"} {
+		if SupportedOnCUDA(quantType) {
+			t.Errorf("SupportedOnCUDA(%q) = true, want false", quantType)
+		}
+	}
+}
+
 func TestBitsAndUnpackedWidth(t *testing.T) {
 	tests := []struct {
 		in       string

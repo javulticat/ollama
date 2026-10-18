@@ -7,6 +7,7 @@ import (
 
 	"github.com/ollama/ollama/mlx"
 	"github.com/ollama/ollama/mlx/mlxtest"
+	"github.com/ollama/ollama/mlx/quant"
 	"github.com/ollama/ollama/mlxrunner/nn"
 )
 
@@ -16,7 +17,11 @@ import (
 func TestMakeLinearLayerAffineWidths(t *testing.T) {
 	const rows, cols, groupSize = 8, 256, 128
 	for _, bits := range []int{1, 2, 3, 4, 5, 6, 8} {
-		mlxtest.RunSubtest(t, fmt.Sprintf("int%d", bits), func(t *mlxtest.T) {
+		quantType := fmt.Sprintf("int%d", bits)
+		mlxtest.RunSubtest(t, quantType, func(t *mlxtest.T) {
+			if mlx.CUDAIsAvailable() && !quant.SupportedOnCUDA(quantType) {
+				t.Skipf("MLX has no %s CUDA kernels", quantType)
+			}
 			weightValues := make([]float32, rows*cols)
 			for i := range weightValues {
 				weightValues[i] = float32((i*7)%13-6) / 16

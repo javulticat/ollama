@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/ollama/ollama/manifest"
+	"github.com/ollama/ollama/mlx"
 	modeltypes "github.com/ollama/ollama/types/model"
 )
 
@@ -23,7 +24,7 @@ type Root struct {
 }
 
 // Open loads a manifest for the given model name and scans tensor blobs for
-// quantization metadata.
+// quantization metadata. On CUDA it rejects weights the backend cannot run.
 func Open(modelName string) (*Root, error) {
 	m, err := manifest.ParseNamedManifest(modeltypes.ParseName(modelName))
 	if err != nil {
@@ -57,6 +58,12 @@ func Open(modelName string) (*Root, error) {
 			if root.groupSize == 0 {
 				root.groupSize = defaultGroupSize(root.quantType)
 			}
+		}
+	}
+
+	if mlx.CUDAIsAvailable() {
+		if err := checkCUDAQuant(root.tensorQuant); err != nil {
+			return nil, err
 		}
 	}
 
