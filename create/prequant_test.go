@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -77,13 +78,7 @@ func checkPlanErr(t *testing.T, err error, want string) {
 }
 
 func TestPlanPrequantizedMLX(t *testing.T) {
-	cfg := sourceModelConfig{Quantization: sourceQuantization{Bits: 4, Mode: "affine", GroupSize: 32}}
-	inv := newInventory(cfg, map[string]string{
-		"l.weight":    "U32",
-		"l.scales":    "BF16",
-		"l.biases":    "BF16",
-		"norm.weight": "BF16",
-	})
+	inv := mlxAffineInventory(sourceQuantization{Bits: 4, Mode: "affine", GroupSize: 32}, 4, 32)
 
 	specs, err := Plan(inv, Classification{Kind: SourcePrequantized}, defaultQuantPolicy{})
 	if err != nil {
@@ -119,11 +114,12 @@ func TestPlanPrequantizedFlintEmbeddingBits(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		raw  string
+		bits int32 // the embedding's packed width
 		want string
 	}{
-		{name: "int8 embedding", raw: `{"mlx_export":{"embedding_bits":8}}`, want: "int8"},
-		{name: "int4 embedding", raw: `{"mlx_export":{"embedding_bits":4}}`, want: "int4"},
-		{name: "missing bit width", raw: `{"mlx_export":{}}`},
+		{name: "int8 embedding", raw: `{"mlx_export":{"embedding_bits":8}}`, bits: 8, want: "int8"},
+		{name: "int4 embedding", raw: `{"mlx_export":{"embedding_bits":4}}`, bits: 4, want: "int4"},
+		{name: "missing bit width", raw: `{"mlx_export":{}}`, bits: 8},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			inv := newInventory(sourceModelConfig{
@@ -137,6 +133,12 @@ func TestPlanPrequantizedFlintEmbeddingBits(t *testing.T) {
 				"model.layers.0.self_attn.q_proj.scales": "BF16",
 				"model.layers.0.self_attn.q_proj.biases": "BF16",
 			})
+			// 128 inputs in groups of 64, packed as the checkpoint stores them.
+			for base, bits := range map[string]int32{"model.embed_tokens": tc.bits, "model.layers.0.self_attn.q_proj": 4} {
+				setShape(inv, base+".weight", 8, 128*bits/32)
+				setShape(inv, base+".scales", 8, 2)
+				setShape(inv, base+".biases", 8, 2)
+			}
 			inv.RawConfig = []byte(tc.raw)
 			specs, err := Plan(inv, Classification{Kind: SourcePrequantized}, defaultQuantPolicy{})
 			if tc.want == "" {
@@ -155,6 +157,96 @@ func TestPlanPrequantizedFlintEmbeddingBits(t *testing.T) {
 			projection, ok := specByName(specs, "model.layers.0.self_attn.q_proj.weight")
 			if !ok || projection.Metadata["quant_type"] != "int4" {
 				t.Errorf("projection quant_type = %q, want int4", projection.Metadata["quant_type"])
+			}
+		})
+	}
+}
+
+func TestPlanPrequantizedMLXAffineWidths(t *testing.T) {
+	tests := []struct {
+		name      string
+		q         sourceQuantization
+		bits      int32
+		wantQuant string
+	}{
+		{"1-bit without mode", sourceQuantization{Bits: 1, GroupSize: 128}, 1, "int1"},
+		{"2-bit affine", sourceQuantization{Bits: 2, Mode: "affine", GroupSize: 128}, 2, "int2"},
+		{"3-bit without mode", sourceQuantization{Bits: 3, GroupSize: 64}, 3, "int3"},
+		{"5-bit affine", sourceQuantization{Bits: 5, Mode: "affine", GroupSize: 32}, 5, "int5"},
+		{"6-bit affine", sourceQuantization{Bits: 6, Mode: "affine", GroupSize: 64}, 6, "int6"},
+		{"8-bit without mode", sourceQuantization{Bits: 8, GroupSize: 64}, 8, "int8"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inv := mlxAffineInventory(tt.q, tt.bits, int32(tt.q.GroupSize))
+			specs, err := Plan(inv, Classification{Kind: SourcePrequantized}, defaultQuantPolicy{})
+			if err != nil {
+				t.Fatalf("Plan() error = %v", err)
+			}
+			w, ok := specByName(specs, "l.weight")
+			if !ok {
+				t.Fatal("missing l.weight blob")
+			}
+			if got, want := w.Metadata["quant_type"], tt.wantQuant; got != want {
+				t.Errorf("quant_type = %q, want %q", got, want)
+			}
+			if got, want := w.Metadata["group_size"], strconv.Itoa(tt.q.GroupSize); got != want {
+				t.Errorf("group_size = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestPlanPrequantizedMLXRejectsWidthMismatch(t *testing.T) {
+	// The config declares 2-bit weights, but this layer is packed at 6 bits,
+	// as an mlx-lm per-module override would leave it.
+	inv := mlxAffineInventory(sourceQuantization{Bits: 2, Mode: "affine", GroupSize: 64}, 6, 64)
+	_, err := Plan(inv, Classification{Kind: SourcePrequantized}, defaultQuantPolicy{})
+	if err == nil || !strings.Contains(err.Error(), "does not match int2 with group size 64") {
+		t.Fatalf("Plan() error = %v, want a width mismatch for l.weight", err)
+	}
+}
+
+// Most MoE runtimes keep routed experts quantized only at 4 and 8 bits, so
+// other widths are rejected at import instead of loading with every expert
+// expanded to full precision. Shared experts, routers, dense layers and
+// Gemma 4's experts load at any width.
+func TestPlanPrequantizedMLXExpertWidths(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		arch    string
+		weight  string
+		bits    int32
+		wantErr bool
+	}{
+		{"stacked experts", "Qwen3_5MoeForCausalLM", "model.layers.0.mlp.switch_mlp.gate_proj", 2, true},
+		{"fused gate-up experts", "Qwen3_5MoeForCausalLM", "model.layers.0.mlp.experts.gate_up_proj", 2, true},
+		{"per-expert weights", "LagunaForCausalLM", "model.layers.0.mlp.experts.3.up_proj", 3, true},
+		{"mixer experts", "NemotronHForCausalLM", "backbone.layers.0.mixer.experts.up_proj", 2, true},
+		{"mixer per-expert weights", "NemotronHForCausalLM", "backbone.layers.0.mixer.experts.0.up_proj", 6, true},
+		{"shared experts", "Glm4MoeLiteForCausalLM", "model.layers.0.mlp.shared_experts.up_proj", 2, false},
+		{"mixer shared experts", "NemotronHForCausalLM", "backbone.layers.0.mixer.shared_experts.up_proj", 2, false},
+		{"shared expert", "Qwen3_5MoeForCausalLM", "model.layers.0.mlp.shared_expert.up_proj", 2, false},
+		{"router", "Qwen3_5MoeForCausalLM", "model.layers.0.mlp.gate", 2, false},
+		{"dense layer", "Qwen3ForCausalLM", "model.layers.0.mlp.up_proj", 1, false},
+		{"gemma4 experts", "Gemma4ForConditionalGeneration", "model.language_model.layers.0.experts.gate_up_proj", 2, false},
+		{"4-bit experts", "Qwen3_5MoeForCausalLM", "model.layers.0.mlp.switch_mlp.gate_proj", 4, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			inv := newInventory(sourceModelConfig{Architectures: []string{tt.arch}, Quantization: sourceQuantization{Bits: int(tt.bits), Mode: "affine", GroupSize: 64}}, map[string]string{
+				tt.weight + ".weight": "U32",
+				tt.weight + ".scales": "F16",
+				tt.weight + ".biases": "F16",
+			})
+			setShape(inv, tt.weight+".weight", 8, 128*tt.bits/32)
+			setShape(inv, tt.weight+".scales", 8, 2)
+			setShape(inv, tt.weight+".biases", 8, 2)
+			_, err := Plan(inv, Classification{Kind: SourcePrequantized}, defaultQuantPolicy{})
+			switch {
+			case tt.wantErr && (err == nil || !strings.Contains(err.Error(), "mixture-of-experts weights are not supported")):
+				t.Fatalf("Plan() error = %v, want an expert width rejection", err)
+			case !tt.wantErr && err != nil:
+				t.Fatalf("Plan() error = %v", err)
 			}
 		})
 	}

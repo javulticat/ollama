@@ -162,12 +162,17 @@ func isStackedExpertWeight(name string) bool {
 		return false
 	}
 
-	// ".experts." covers the common case (.mlp.experts., .moe.experts.) as well
-	// as gemma's bare "...layers.N.experts.gate_up_proj" (no .mlp/.moe prefix).
-	return strings.Contains(name, ".experts.") ||
-		strings.Contains(name, ".mlp.switch_mlp.") ||
+	return isRoutedExpertWeight(name) ||
 		strings.Contains(name, ".mlp.shared_experts.") ||
 		strings.Contains(name, ".mixer.shared_experts.")
+}
+
+// isRoutedExpertWeight reports whether name belongs to a bank of routed MoE
+// experts, which the MLX runner multiplies through gather_qmm. ".experts."
+// covers the common case (.mlp.experts., .moe.experts.) as well as gemma's
+// bare "...layers.N.experts.gate_up_proj" (no .mlp/.moe prefix).
+func isRoutedExpertWeight(name string) bool {
+	return strings.Contains(name, ".experts.") || strings.Contains(name, ".mlp.switch_mlp.")
 }
 
 // isRoutingGate reports the small MoE routing/gate weights that select the

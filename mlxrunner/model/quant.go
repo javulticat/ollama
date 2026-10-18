@@ -247,7 +247,9 @@ func ResolveLinearQuantParams(
 }
 
 // InferAffineQuantParamsFromShapes infers (groupSize,bits) for affine quantized
-// tensors from packed weight and scale shapes.
+// tensors from packed weight and scale shapes. It only distinguishes 4-bit from
+// 8-bit: other widths alias them (2-bit/128 packs like 4-bit/64), so tensors at
+// those widths rely on the quant metadata the importer records.
 func InferAffineQuantParamsFromShapes(weight, scales *mlx.Array, hintBits int) (groupSize, bits int, ok bool) {
 	if weight == nil || scales == nil {
 		return 0, 0, false

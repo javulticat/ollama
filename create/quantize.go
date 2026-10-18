@@ -124,7 +124,7 @@ func quantizeItemArrays(it quantizeItem, arrays map[string]*mlx.Array, tmpDir st
 // temp file. Wiring a streaming mlx_load_safetensors_reader into the CGO wrapper
 // would let us load from the reader directly and drop the temp files.
 func loadAndQuantizeArray(r io.Reader, name, quantize string, decodeFP8 bool, arrays map[string]*mlx.Array, tmpDir string) (tmpPath string, toEval []*mlx.Array, nativeHandle *mlx.SafetensorsFile, err error) {
-	if quantize != "" && quant.Canonical(quantize) == "" {
+	if quantize != "" && !quant.Requestable(quantize) {
 		return "", nil, nil, fmt.Errorf("unsupported quantization type: %s", quantize)
 	}
 

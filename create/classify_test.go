@@ -55,6 +55,21 @@ func TestClassify(t *testing.T) {
 			wantQuant: "int4",
 		},
 		{
+			name:      "mlx prequantized 2-bit",
+			cfg:       sourceModelConfig{Quantization: sourceQuantization{Bits: 2, Mode: "affine", GroupSize: 128}},
+			tensors:   map[string]string{"model.layers.0.weight": "U32", "model.layers.0.scales": "F16"},
+			wantKind:  SourcePrequantized,
+			wantQuant: "int2",
+		},
+		{
+			// mlx-lm omits the mode for its default, affine.
+			name:      "mlx prequantized 1-bit without mode",
+			cfg:       sourceModelConfig{Quantization: sourceQuantization{Bits: 1, GroupSize: 128}},
+			tensors:   map[string]string{"model.layers.0.weight": "U32", "model.layers.0.scales": "F16"},
+			wantKind:  SourcePrequantized,
+			wantQuant: "int1",
+		},
+		{
 			name:     "mlx prequantized without quantization metadata",
 			tensors:  map[string]string{"model.layers.0.weight": "U32", "model.layers.0.scales": "BF16"},
 			wantKind: SourcePrequantized,
@@ -128,6 +143,14 @@ func TestClassifyErrors(t *testing.T) {
 			name:      "invalid quantize type",
 			tensors:   map[string]string{"model.layers.0.weight": "BF16"},
 			requested: "int3",
+			wantErr:   "unsupported quantize type",
+		},
+		{
+			// Low-bit affine types import prequantized but are not offered
+			// for quantizing during create.
+			name:      "low-bit quantize type",
+			tensors:   map[string]string{"model.layers.0.weight": "BF16"},
+			requested: "int2",
 			wantErr:   "unsupported quantize type",
 		},
 		{

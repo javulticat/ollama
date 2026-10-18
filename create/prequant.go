@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/ollama/ollama/mlx/quant"
 )
 
 // prequantPattern describes how one producer packs an already-quantized weight
@@ -129,6 +132,16 @@ func planPrequantized(inv Inventory) ([]BlobSpec, error) {
 				spec.Metadata["quant_type"] = "int8"
 			}
 			fused[embedding] = spec
+		}
+	}
+
+	// Check each blob against its final metadata, after Flint's correction.
+	for _, name := range sortedKeys(fused) {
+		if err := checkAffineWidth(fused[name]); err != nil {
+			return nil, err
+		}
+		if err := checkExpertWidth(fused[name], inv.Config.Architecture()); err != nil {
+			return nil, err
 		}
 	}
 
@@ -397,6 +410,52 @@ func inferableFromShapes(quantType string, groupSize int) bool {
 		return groupSize == 64 || groupSize == 128
 	}
 	return false
+}
+
+// checkAffineWidth verifies that a fused affine blob's packed weight and scales
+// agree with the bit width and group size recorded in its metadata. The
+// metadata comes from the config's single quantization entry (for Flint's
+// embedding, from mlx_export.embedding_bits), and the loader trusts it over the
+// tensor shapes, so a tensor quantized differently (as with mlx-lm's per-module
+// overrides) would otherwise load at the wrong width.
+func checkAffineWidth(spec BlobSpec) error {
+	groupSize, bits, mode := quant.Params(spec.Metadata["quant_type"])
+	if mode != "affine" {
+		return nil
+	}
+	if gs, err := strconv.Atoi(spec.Metadata["group_size"]); err == nil {
+		groupSize = gs
+	}
+	weightIndex := slices.IndexFunc(spec.Tensors, func(t TensorSpec) bool { return t.Name == spec.Name })
+	scaleIndex := slices.IndexFunc(spec.Tensors, func(t TensorSpec) bool { return t.Name == spec.Name+".scale" })
+	if weightIndex < 0 || scaleIndex < 0 {
+		return nil
+	}
+	weight, scale := spec.Tensors[weightIndex].Sources[0], spec.Tensors[scaleIndex].Sources[0]
+	if !strings.EqualFold(weight.Dtype, "U32") || len(weight.Shape) == 0 || len(scale.Shape) == 0 {
+		return nil
+	}
+	packed := int64(weight.Shape[len(weight.Shape)-1])
+	groups := int64(scale.Shape[len(scale.Shape)-1])
+	if packed*32 != groups*int64(groupSize)*int64(bits) {
+		return fmt.Errorf("%s: packed width %d with %d scale groups does not match %s with group size %d from config.json", spec.Name, packed, groups, spec.Metadata["quant_type"], groupSize)
+	}
+	return nil
+}
+
+// checkExpertWidth rejects routed MoE experts at an affine width the
+// architecture's MLX runtime cannot keep quantized. The MoE runtimes that gate
+// on supportsGatherQMM keep routed experts quantized only at 4- and 8-bit
+// affine; they dequantize other widths at load (qwen4_exp refuses them),
+// multiplying expert memory several times over. Flint's runtime refuses them
+// too. Gemma 4 keeps experts quantized at every width.
+func checkExpertWidth(spec BlobSpec, arch string) error {
+	_, bits, mode := quant.Params(spec.Metadata["quant_type"])
+	if mode != "affine" || bits == 4 || bits == 8 || !isRoutedExpertWeight(spec.Name) ||
+		strings.Contains(strings.ToLower(arch), "gemma4") {
+		return nil
+	}
+	return fmt.Errorf("%s: %s mixture-of-experts weights are not supported yet; experts must be 4- or 8-bit", spec.Name, spec.Metadata["quant_type"])
 }
 
 func f32ScaleTransform(t SourceTensor) Transform {

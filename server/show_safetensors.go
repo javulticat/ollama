@@ -275,11 +275,12 @@ func getTensorInfoFromManifest(mf *manifest.Manifest) ([]api.Tensor, error) {
 				}
 
 				// Quantized weights are packed into U32 words; report the
-				// logical unpacked shape. PackFactor covers every quant type
-				// the engine produces (including mxfp4) from one table.
-				packFactor := int64(quant.PackFactor(info.QuantType))
-				if packFactor > 0 && len(shape) >= 2 {
-					shape[len(shape)-1] = uint64(info.Shape[len(info.Shape)-1] * packFactor)
+				// logical unpacked shape. UnpackedWidth covers every quant
+				// type the engine loads (including mxfp4) from one table.
+				if len(shape) >= 2 {
+					if width := quant.UnpackedWidth(info.QuantType, info.Shape[len(info.Shape)-1]); width > 0 {
+						shape[len(shape)-1] = uint64(width)
+					}
 				}
 
 				tensors = append(tensors, api.Tensor{
