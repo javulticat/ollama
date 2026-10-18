@@ -1,6 +1,7 @@
 package nn
 
 import (
+	"fmt"
 	"math"
 	"testing"
 
@@ -93,6 +94,38 @@ func TestHadamardLinearQuantizedInner(t *testing.T) {
 		dense := mlx.Dequantize(inner.Weight, inner.Scales, inner.QBiases, groupSize, bits, "affine", nil)
 		want := mlx.Matmul(rotation.Forward(x).AsType(mlx.DTypeFloat32), mlx.Transpose(dense.AsType(mlx.DTypeFloat32), 1, 0))
 		requireAllClose(t, "output", got, want, 2e-2)
+	})
+}
+
+// The compiled rotations serve one block size at several feature widths, as a
+// model's projections do, and every call matches the rotation computed
+// directly as the leading dimensions change between prefill and decode, in
+// float32 and in the float16 Prism packs run in.
+func TestHadamardSharesBlockAcrossWidths(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		mlx.EnableCompile()
+		const block = 32
+		scale := float32(1 / math.Sqrt(block))
+		for _, tc := range []struct {
+			dtype     mlx.DType
+			tolerance float64
+		}{{mlx.DTypeFloat32, 1e-5}, {mlx.DTypeFloat16, 2e-3}} {
+			for _, shape := range [][]int{{1, 5, 64}, {1, 1, 64}, {2, 5, 96}, {1, 1, 96}, {3, 64}, {4, 96}} {
+				width, rows := shape[len(shape)-1], 1
+				for _, d := range shape[:len(shape)-1] {
+					rows *= d
+				}
+				rotation := testRotation(width, block)
+				x := testValues(rows, width, 3).Reshape(shape...).AsType(tc.dtype)
+				want := mlx.HadamardTransform(mlx.Mul(x.AsType(mlx.DTypeFloat32), rotation.Signs).Reshape(-1, block), scale).Reshape(shape...).AsType(tc.dtype)
+				got := rotation.Forward(x)
+				if got.DType() != tc.dtype {
+					t.Fatalf("forward %v %v: dtype = %v", tc.dtype, shape, got.DType())
+				}
+				requireAllClose(t, fmt.Sprintf("forward %v %v", tc.dtype, shape), got, want, tc.tolerance)
+				requireAllClose(t, fmt.Sprintf("inverse %v %v", tc.dtype, shape), rotation.Inverse(want), x, tc.tolerance)
+			}
+		}
 	})
 }
 

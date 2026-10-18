@@ -319,6 +319,20 @@ func (t *Array) Transpose(axes ...int) *Array {
 	return out
 }
 
+// Unflatten splits axis into shape, which may hold one -1 to infer. Unlike a
+// reshape to explicit dimensions, it keeps working under a shapeless compile
+// as the other dimensions change.
+func (t *Array) Unflatten(axis int, shape ...int) *Array {
+	cShape := make([]C.int, len(shape))
+	for i := range shape {
+		cShape[i] = C.int(shape[i])
+	}
+
+	out := New("UNFLATTEN")
+	mlxCheck(C.mlx_unflatten(&out.ctx, t.ctx, C.int(axis), unsafe.SliceData(cShape), C.size_t(len(cShape)), DefaultStream().ctx))
+	return out
+}
+
 func Zeros(dtype DType, shape ...int) *Array {
 	cAxes := make([]C.int, len(shape))
 	for i := range shape {
