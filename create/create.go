@@ -500,8 +500,9 @@ func (cfg sourceModelConfig) QuantMetadata() map[string]string {
 	// default would mislabel modules whose entries differ from it. Such a config
 	// without a mode records nothing, and the loader infers each weight from its
 	// shapes as it always has; checkModuleQuantization refuses the ones whose
-	// layouts it can't read that way. Configs that state a mode still record the
-	// default, pending support for per-module entries.
+	// layouts it can't read that way. A config with a mode records the
+	// default, and checkModuleQuantization refuses it when a weight's entry
+	// differs.
 	if q.Mode == "" && q.mixedPrecision() {
 		return nil
 	}

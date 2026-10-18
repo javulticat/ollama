@@ -199,7 +199,8 @@ func TestPlanPrequantizedMLXAffineWidths(t *testing.T) {
 
 func TestPlanPrequantizedMLXRejectsWidthMismatch(t *testing.T) {
 	// The config declares 2-bit weights, but this layer is packed at 6 bits,
-	// as an mlx-lm per-module override would leave it.
+	// as a converter that does not declare its per-module overrides would
+	// leave it.
 	inv := mlxAffineInventory(sourceQuantization{Bits: 2, Mode: "affine", GroupSize: 64}, 6, 64)
 	_, err := Plan(inv, Classification{Kind: SourcePrequantized}, defaultQuantPolicy{})
 	if err == nil || !strings.Contains(err.Error(), "does not match int2 with group size 64") {
@@ -594,9 +595,11 @@ func TestPlanPrequantizedMLXWithoutMode(t *testing.T) {
 	}
 }
 
-// A config without a mode whose per-module entries differ from the default
-// records no type, so the loader reads each weight from its shapes. Weights at
-// layouts it can't read that way are refused at import.
+// A config with a mode records the default for every weight, so a weight whose
+// per-module entry differs is refused at import. A config without a mode whose
+// entries differ from the default records no type, so the loader reads each
+// weight from its shapes, and weights at layouts it can't read that way are
+// refused.
 func TestPlanPrequantizedMLXModuleEntries(t *testing.T) {
 	for _, tt := range []struct {
 		name            string
@@ -727,6 +730,58 @@ func TestPlanPrequantizedMLXModuleEntries(t *testing.T) {
 			bits:      4,
 			groupSize: 64,
 			wantErr:   `l: config.json quantizes this module with mode "fp4", which is not supported`,
+		},
+		{
+			name:      "restates a low-bit default",
+			q:         sourceQuantization{Bits: 3, GroupSize: 64, Modules: map[string]moduleQuantization{"l": {Bits: 3, GroupSize: 64, Mode: "affine"}}},
+			bits:      3,
+			groupSize: 64,
+		},
+		{
+			name:      "a low-bit default",
+			q:         sourceQuantization{Bits: 2, GroupSize: 64, Modules: map[string]moduleQuantization{"e": {Bits: 8, GroupSize: 64}}},
+			bits:      2,
+			groupSize: 64,
+			wantErr:   "l: config.json quantizes this module as int2 with group size 64 and e differently",
+		},
+		{
+			name:      "a low-bit entry",
+			q:         sourceQuantization{Bits: 3, GroupSize: 64, Modules: map[string]moduleQuantization{"l": {Bits: 6, GroupSize: 64}}},
+			bits:      6,
+			groupSize: 64,
+			wantErr:   "l: config.json quantizes this module as int6 with group size 64, unlike the model's int3 with group size 64; mixed-precision checkpoints are not supported yet",
+		},
+		{
+			// The default is recorded, so even a layout shapes would identify
+			// loads at the wrong width.
+			name:      "mode stated, differing entry",
+			q:         sourceQuantization{Bits: 4, GroupSize: 32, Mode: "affine", Modules: map[string]moduleQuantization{"l": {Bits: 8, GroupSize: 64}}},
+			bits:      8,
+			groupSize: 64,
+			wantErr:   "l: config.json quantizes this module as int8 with group size 64, unlike the model's int4 with group size 32",
+		},
+		{
+			// Packed exactly like the default, so only the config tells them apart.
+			name:      "mode stated, bits and group size changed inversely",
+			q:         sourceQuantization{Bits: 2, GroupSize: 64, Mode: "affine", Modules: map[string]moduleQuantization{"l": {Bits: 4, GroupSize: 32}}},
+			bits:      4,
+			groupSize: 32,
+			wantErr:   "as int4 with group size 32, unlike the model's int2 with group size 64",
+		},
+		{
+			// mlx-lm keeps MoE routers at 8-bit affine under an mxfp4 default.
+			name:      "mode stated, affine router under an mxfp4 default",
+			q:         sourceQuantization{Bits: 4, GroupSize: 32, Mode: "mxfp4", Modules: map[string]moduleQuantization{"l": {Bits: 8, GroupSize: 64}}},
+			bits:      8,
+			groupSize: 64,
+			wantErr:   "as int8 with group size 64, unlike the model's mxfp4 with group size 32",
+		},
+		{
+			name:      "mode stated, unreadable entry",
+			q:         sourceQuantization{Bits: 4, GroupSize: 64, Mode: "affine", Modules: map[string]moduleQuantization{"l": {Unreadable: true}}},
+			bits:      4,
+			groupSize: 64,
+			wantErr:   "l: config.json's quantization entry for this module has unreadable bits, group_size or mode",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

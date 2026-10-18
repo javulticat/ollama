@@ -341,15 +341,17 @@ func matchPrequant(name string, inv Inventory) (BlobSpec, []string, bool) {
 	return BlobSpec{}, nil, false
 }
 
-// checkModuleQuantization rejects an int4 or int8 config without a mode whose
-// per-module entries quantize some modules differently from the default,
-// unless the loader reads every weight correctly from its tensor shapes. Such
-// a config records no type (see QuantMetadata), and shapes identify only some
-// layouts; the loader would fail to load the others or load them at the wrong
-// width.
+// checkModuleQuantization rejects mixed-precision MLX checkpoints, whose
+// per-module entries quantize some modules differently from the default, when
+// the loader would read a weight at the wrong width. A config with a mode
+// records the default for every weight and the loader trusts it, so any weight
+// whose entry differs is refused. A config without a mode records no type (see
+// QuantMetadata), and shapes identify only some layouts, so a weight at any
+// other layout is refused; one whose weights all use those layouts loads as it
+// always has.
 func checkModuleQuantization(inv Inventory) error {
 	q := inv.Config.declaredQuantization()
-	if q.Mode != "" || q.quantType() == "" || !q.mixedPrecision() {
+	if q.quantType() == "" || !q.mixedPrecision() {
 		return nil
 	}
 	wantType, wantGroupSize := q.defaults().settings()
@@ -366,10 +368,11 @@ func checkModuleQuantization(inv Inventory) error {
 			}
 			quantType, groupSize = m.settings()
 		}
-		if inferableFromShapes(quantType, groupSize) {
+		keepsDefault := quantType == wantType && groupSize == wantGroupSize
+		if q.Mode == "" && inferableFromShapes(quantType, groupSize) || q.Mode != "" && keepsDefault {
 			continue
 		}
-		if quantType == wantType && groupSize == wantGroupSize {
+		if keepsDefault {
 			return fmt.Errorf("%s: config.json quantizes this module as %s with group size %d and %s differently; mixed-precision checkpoints are not supported yet",
 				path, quantType, groupSize, q.firstMixedModule())
 		}
@@ -414,10 +417,12 @@ func inferableFromShapes(quantType string, groupSize int) bool {
 
 // checkAffineWidth verifies that a fused affine blob's packed weight and scales
 // agree with the bit width and group size recorded in its metadata. The
-// metadata comes from the config's single quantization entry (for Flint's
+// metadata comes from the config's default quantization (for Flint's
 // embedding, from mlx_export.embedding_bits), and the loader trusts it over the
-// tensor shapes, so a tensor quantized differently (as with mlx-lm's per-module
-// overrides) would otherwise load at the wrong width.
+// tensor shapes, so a tensor quantized differently without the config saying
+// so would otherwise load at the wrong width. Shapes only fix the product of
+// bits and group size, so a tensor that changes both inversely passes;
+// checkModuleQuantization catches those when the config declares them.
 func checkAffineWidth(spec BlobSpec) error {
 	groupSize, bits, mode := quant.Params(spec.Metadata["quant_type"])
 	if mode != "affine" {
