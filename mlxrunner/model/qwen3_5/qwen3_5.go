@@ -2,6 +2,7 @@
 package qwen3_5
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -112,6 +113,18 @@ type Model struct {
 	*Config
 
 	weightPrefix string
+	// draftPrefix names the tensors of a separately imported draft model that
+	// share this model's manifest; empty when there is none.
+	draftPrefix string
+	// hadamardModules is a Prism Hadamard pack's packed module manifest; nil
+	// for ordinary checkpoints.
+	hadamardModules []hadamardModule
+}
+
+// linearMaker builds the linear layer stored at a tensor path, or returns nil
+// when there is none.
+type linearMaker interface {
+	Make(path string) nn.LinearLayer
 }
 
 // MTPHead is the multi-token-prediction draft head; it writes one KV cache
@@ -450,8 +463,17 @@ func NewModel(root *model.Root) (model.Model, error) {
 	for i := range cfg.NumHiddenLayers {
 		m.Layers[i] = &Layer{IsLinear: layerIsLinear(&cfg, i)}
 	}
+	if root.Draft != nil {
+		m.draftPrefix = cmp.Or(root.Draft.TensorPrefix, "draft.")
+	}
 
 	return m, nil
+}
+
+// isDraftTensor reports whether name belongs to a separately imported draft
+// model rather than to this model.
+func (m *Model) isDraftTensor(name string) bool {
+	return m.draftPrefix != "" && strings.HasPrefix(name, m.draftPrefix)
 }
 
 func tensorAny(tensors map[string]*mlx.Array, keys ...string) (*mlx.Array, string) {
@@ -893,6 +915,24 @@ func loadNorm(tensors map[string]*mlx.Array, key string, shift bool, eps float32
 	return nn.NewRMSNorm(w, eps)
 }
 
+// storesZeroCenteredNorms reports whether the checkpoint stores its RMSNorm
+// weights zero-centered, as reference checkpoints do (recognized by their MTP
+// tensors or unsanitized conv weights), rather than with the +1 MLX
+// conversions bake in. A separately imported draft's tensors say nothing
+// about this model's layout.
+func (m *Model) storesZeroCenteredNorms(tensors map[string]*mlx.Array) bool {
+	for name, t := range tensors {
+		if m.isDraftTensor(name) {
+			continue
+		}
+		if strings.Contains(name, "mtp.") ||
+			(strings.Contains(name, ".linear_attn.conv1d.weight") && t != nil && t.NumDims() == 3 && t.Dim(2) != 1) {
+			return true
+		}
+	}
+	return false
+}
+
 // LoadWeights assigns tensors to model fields.
 func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	layout := resolveTensorPathLayout(tensors)
@@ -901,20 +941,27 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	modelPrefix := layout.containerPrefix + layout.modelPrefix
 	cfg := m.Config
 
-	linears := model.NewLinearFactory(tensors, cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode, cfg.TensorQuant)
-
-	shouldShiftNormWeights := false
-	for name, t := range tensors {
-		if strings.Contains(name, "mtp.") ||
-			(strings.Contains(name, ".linear_attn.conv1d.weight") && t != nil && t.NumDims() == 3 && t.Dim(2) != 1) {
-			shouldShiftNormWeights = true
-			break
+	factory := model.NewLinearFactory(tensors, cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode, cfg.TensorQuant)
+	var linears linearMaker = factory
+	var rotated *rotatingLinears
+	if m.hadamardModules != nil {
+		rotations, err := m.hadamardRotations(tensors, layout)
+		if err != nil {
+			return err
 		}
+		castHadamardActivations(tensors, layout.containerPrefix)
+		rotated = newRotatingLinears(factory, rotations)
+		linears = rotated
 	}
+
+	shouldShiftNormWeights := m.storesZeroCenteredNorms(tensors)
 
 	embedTokens := model.MakeEmbeddingLayer(tensors, modelPrefix+"embed_tokens", cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode, cfg.TensorQuant)
 	if embedTokens == nil {
 		return fmt.Errorf("missing embedding weight: %sembed_tokens.weight", modelPrefix)
+	}
+	if rotated != nil {
+		embedTokens = rotated.embedding(embedTokens, modelPrefix+"embed_tokens")
 	}
 	m.EmbedTokens = embedTokens
 
@@ -935,8 +982,8 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 
 	useQuantizedExperts := supportsGatherQMM(cfg.QuantMode, cfg.QuantBits)
 	if !useQuantizedExperts && cfg.TensorQuant != nil {
-		for _, tq := range cfg.TensorQuant {
-			if tq == nil {
+		for name, tq := range cfg.TensorQuant {
+			if tq == nil || m.isDraftTensor(name) {
 				continue
 			}
 			_, bits, mode := model.QuantizationParams(tq.QuantType)
@@ -965,12 +1012,18 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		}
 	}
 
-	return m.loadVisionWeights(tensors, linears)
+	if rotated != nil {
+		if err := rotated.checkApplied(); err != nil {
+			return err
+		}
+	}
+
+	return m.loadVisionWeights(tensors, factory)
 }
 
 // loadLayer builds a decoder layer from tensors at layerPrefix. It serves both
 // the main stack and the MTP head's single full-attention layer.
-func loadLayer(linears model.LinearFactory, tensors map[string]*mlx.Array, cfg *Config, layerPrefix string, isLinear, useMoE, useQuantizedExperts, shiftNorms bool) (*Layer, error) {
+func loadLayer(linears linearMaker, tensors map[string]*mlx.Array, cfg *Config, layerPrefix string, isLinear, useMoE, useQuantizedExperts, shiftNorms bool) (*Layer, error) {
 	layer := &Layer{IsLinear: isLinear}
 
 	layer.InputNorm = loadNorm(tensors, layerPrefix+".input_layernorm.weight", shiftNorms, cfg.RMSNormEps)
@@ -1093,7 +1146,7 @@ func loadLayer(linears model.LinearFactory, tensors map[string]*mlx.Array, cfg *
 // loadMTPHead builds the MTP head from the mtp.* tensors. Its single decoder
 // layer is full attention even when the main stack is hybrid; lm_head and
 // embeddings are shared with the target.
-func (m *Model) loadMTPHead(linears model.LinearFactory, tensors map[string]*mlx.Array, useQuantizedExperts, shiftNorms bool) error {
+func (m *Model) loadMTPHead(linears linearMaker, tensors map[string]*mlx.Array, useQuantizedExperts, shiftNorms bool) error {
 	cfg := m.Config
 	mtpPrefix := "mtp."
 

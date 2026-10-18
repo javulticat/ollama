@@ -116,6 +116,55 @@ func TestConcatProjectionPairQuantized(t *testing.T) {
 	})
 }
 
+func TestConcatProjectionPairRotated(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		const in = 64
+		signs := func(flipFrom int) *mlx.Array {
+			values := make([]float32, in)
+			for i := range values {
+				values[i] = 1
+				if i >= flipFrom {
+					values[i] = -1
+				}
+			}
+			return mlx.FromValues(values, in)
+		}
+		// Equal signs in distinct arrays, as every module of a pack ships its own.
+		rotation := &nn.Hadamard{Signs: signs(32), Block: 32}
+		sameSigns := &nn.Hadamard{Signs: signs(32), Block: 32}
+		otherSigns := &nn.Hadamard{Signs: signs(in), Block: 32}
+		rotated := func(rows int, r *nn.Hadamard) *nn.HadamardLinear {
+			return &nn.HadamardLinear{Inner: nn.NewQuantizedLinear(patternArray(rows, in).AsType(mlx.DTypeFloat32), nil, 32, 4, "affine"), Rotation: r}
+		}
+
+		hi, lo := rotated(16, rotation), rotated(8, sameSigns)
+		packed, err := concatProjectionPair(hi, lo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, ok := packed.(*nn.HadamardLinear)
+		if !ok {
+			t.Fatalf("packed projection is %T, want *nn.HadamardLinear", packed)
+		}
+		q, ok := r.Inner.(*nn.QuantizedLinear)
+		if !ok {
+			t.Fatalf("packed inner projection is %T, want *nn.QuantizedLinear", r.Inner)
+		}
+		assertBitEqual(t, "weight", q.Weight, mlx.Concatenate([]*mlx.Array{
+			hi.Inner.(*nn.QuantizedLinear).Weight, lo.Inner.(*nn.QuantizedLinear).Weight,
+		}, 0))
+
+		for name, pair := range map[string][2]nn.LinearLayer{
+			"different signs": {rotated(16, rotation), rotated(8, otherSigns)},
+			"one unrotated":   {rotated(16, rotation), rotated(8, rotation).Inner},
+		} {
+			if _, err := concatProjectionPair(pair[0], pair[1]); err == nil {
+				t.Errorf("%s: concatProjectionPair succeeded, want an input rotation error", name)
+			}
+		}
+	})
+}
+
 func TestConcatProjectionPairMixedFallsBackToDense(t *testing.T) {
 	mlxtest.Run(t, func(t *mlxtest.T) {
 		in := 64

@@ -123,6 +123,14 @@ func TestInferSafetensorsConfigFamilies(t *testing.T) {
 			wantCaps:     []string{"completion", "vision", "tools", "thinking"},
 		},
 		{
+			// Prism ML's Hadamard packs (Ternary Bonsai 2) name only a model_type.
+			name:         "qwen3.5 prism hadamard",
+			config:       `{"model_type":"prism_hadamard_qwen35","base_model_type":"qwen3_5","vision_config":{}}`,
+			wantParser:   "qwen3.5",
+			wantRenderer: "qwen3.5",
+			wantCaps:     []string{"completion", "vision", "tools", "thinking"},
+		},
+		{
 			name:            "pplx decision text",
 			config:          `{"architectures":["Qwen3_5Model"]}`,
 			decisionSidecar: true,

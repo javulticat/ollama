@@ -28,9 +28,11 @@ func TestValidateMLXModelFallsBackToModelType(t *testing.T) {
 		t.Fatalf("validateMLXSource() error = %v, want unsupported model \"qwen3\"", err)
 	}
 
-	err = validateMLXSource(sourceModelConfig{ModelType: "gemma4_unified"}, false, MLXValidationOptions{})
-	if errors.Is(err, ErrUnsupportedMLXArchitecture) {
-		t.Fatalf("validateMLXSource() error = %v, want gemma4_unified supported", err)
+	for _, modelType := range []string{"gemma4_unified", "prism_hadamard_qwen35"} {
+		err = validateMLXSource(sourceModelConfig{ModelType: modelType}, false, MLXValidationOptions{})
+		if errors.Is(err, ErrUnsupportedMLXArchitecture) {
+			t.Fatalf("validateMLXSource() error = %v, want %s supported", err, modelType)
+		}
 	}
 }
 

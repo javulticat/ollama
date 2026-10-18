@@ -185,7 +185,8 @@ func alwaysSupportsThinking(architectures []string, modelType string) bool {
 
 func isQwen35Family(s string) bool {
 	s = strings.ToLower(s)
-	return strings.Contains(s, "qwen3_5") || strings.Contains(s, "qwen3next")
+	// "qwen35" covers derived model types such as prism_hadamard_qwen35.
+	return strings.Contains(s, "qwen3_5") || strings.Contains(s, "qwen35") || strings.Contains(s, "qwen3next")
 }
 
 func isQwen4Family(s string) bool {

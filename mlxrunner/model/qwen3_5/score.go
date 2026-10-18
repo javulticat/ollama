@@ -8,8 +8,12 @@ import (
 // UnembedCandidates scores one hidden position in FP32, gathering candidate rows
 // before conversion to avoid an FP32 copy of the full vocabulary head.
 func (m *Model) UnembedCandidates(hidden, candidates *mlx.Array) *mlx.Array {
+	head := m.LMHead
+	if rotated, ok := head.(*nn.HadamardLinear); ok {
+		hidden, head = rotated.Rotation.Forward(hidden), rotated.Inner
+	}
 	var weight, bias *mlx.Array
-	switch head := m.LMHead.(type) {
+	switch head := head.(type) {
 	case *nn.Linear:
 		weight, bias = head.Weight.TakeAxis(candidates, 0), head.Bias
 	case *nn.QuantizedLinear:

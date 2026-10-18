@@ -80,3 +80,39 @@ func TestUnembedQuantizedCandidates(t *testing.T) {
 		})
 	}
 }
+
+// A Hadamard-rotated tied head (Prism packs) keeps the FP32 candidate path:
+// the hidden state is rotated, then scored against the stored rows.
+func TestUnembedRotatedCandidates(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		mlx.Scoped(func() {
+			values := make([]float32, 32*64)
+			for i := range values {
+				values[i] = float32(math.Sin(float64(i)))
+			}
+			signs := make([]float32, 64)
+			for i := range signs {
+				signs[i] = float32(1 - 2*(i%3%2))
+			}
+			rotation := &nn.Hadamard{Signs: mlx.FromValues(signs, 64), Block: 32}
+			weight := mlx.FromValues(values, 32, 64).AsType(mlx.DTypeBFloat16)
+			m := &Model{LMHead: &nn.HadamardLinear{Inner: nn.NewLinear(weight, nil), Rotation: rotation}}
+			hidden := mlx.FromValues(values[:64], 1, 1, 64).AsType(mlx.DTypeBFloat16)
+			ids := mlx.FromValues([]int32{31, 2, 0}, 3)
+
+			got := m.UnembedCandidates(hidden, ids)
+			want := m.Unembed(hidden).AsType(mlx.DTypeFloat32).Reshape(-1).TakeAxis(ids, 0)
+			mlx.Eval(got, want)
+			if got.DType() != mlx.DTypeFloat32 || got.Dim(0) != 3 {
+				t.Fatal("rotated candidate logits must be FP32")
+			}
+			actual, expected := got.Floats(), want.Floats()
+			for i, v := range actual {
+				// The full unembed rounds through bfloat16.
+				if math.Abs(float64(v-expected[i])) > 0.05*math.Max(math.Abs(float64(expected[i])), 1) {
+					t.Fatalf("candidate %d: selected=%g full=%g", i, v, expected[i])
+				}
+			}
+		})
+	})
+}
