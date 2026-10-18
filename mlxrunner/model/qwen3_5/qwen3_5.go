@@ -502,6 +502,20 @@ func supportsGatherQMM(mode string, bits int) bool {
 	}
 }
 
+// anyGatherQMMTensor reports whether any tensor selected by include is
+// quantized in a format gather_qmm supports, so experts can stay quantized.
+func anyGatherQMMTensor(tensorQuant map[string]*model.TensorQuantInfo, include func(name string) bool) bool {
+	for name, tq := range tensorQuant {
+		if tq == nil || !include(name) {
+			continue
+		}
+		if _, bits, mode := model.QuantizationParams(tq.QuantType); supportsGatherQMM(mode, bits) {
+			return true
+		}
+	}
+	return false
+}
+
 func freeTensorKeys(tensors map[string]*mlx.Array, keys ...string) {
 	for _, k := range keys {
 		if k == "" {
@@ -980,19 +994,8 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		m.LMHead = m.EmbedTokens.AsLinear()
 	}
 
-	useQuantizedExperts := supportsGatherQMM(cfg.QuantMode, cfg.QuantBits)
-	if !useQuantizedExperts && cfg.TensorQuant != nil {
-		for name, tq := range cfg.TensorQuant {
-			if tq == nil || m.isDraftTensor(name) {
-				continue
-			}
-			_, bits, mode := model.QuantizationParams(tq.QuantType)
-			if supportsGatherQMM(mode, bits) {
-				useQuantizedExperts = true
-				break
-			}
-		}
-	}
+	useQuantizedExperts := supportsGatherQMM(cfg.QuantMode, cfg.QuantBits) ||
+		anyGatherQMMTensor(cfg.TensorQuant, func(name string) bool { return !m.isDraftTensor(name) })
 
 	for i := range cfg.NumHiddenLayers {
 		layerPrefix := fmt.Sprintf("%slayers.%d", modelPrefix, i)
@@ -1007,9 +1010,11 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	// num_nextn_predict_layers while a package ships without them. mtp.* names
 	// carry no container prefix.
 	if fc, _ := tensorByBase(tensors, "mtp.fc"); fc != nil {
-		if err := m.loadMTPHead(linears, tensors, useQuantizedExperts, shouldShiftNormWeights); err != nil {
+		head, err := loadMTPHead(linears, tensors, cfg, "mtp.", useQuantizedExperts, shouldShiftNormWeights)
+		if err != nil {
 			return err
 		}
+		m.MTP = head
 	}
 
 	if rotated != nil {
@@ -1143,30 +1148,25 @@ func loadLayer(linears linearMaker, tensors map[string]*mlx.Array, cfg *Config, 
 	return layer, nil
 }
 
-// loadMTPHead builds the MTP head from the mtp.* tensors. Its single decoder
-// layer is full attention even when the main stack is hybrid; lm_head and
-// embeddings are shared with the target.
-func (m *Model) loadMTPHead(linears linearMaker, tensors map[string]*mlx.Array, useQuantizedExperts, shiftNorms bool) error {
-	cfg := m.Config
-	mtpPrefix := "mtp."
-
+// loadMTPHead builds an MTP head from the tensors under prefix. Its single
+// decoder layer is full attention even when the main stack is hybrid; lm_head
+// and embeddings are shared with the target.
+func loadMTPHead(linears linearMaker, tensors map[string]*mlx.Array, cfg *Config, prefix string, useQuantizedExperts, shiftNorms bool) (*MTPHead, error) {
 	head := &MTPHead{}
-	head.Enorm = loadNorm(tensors, mtpPrefix+"pre_fc_norm_embedding.weight", shiftNorms, cfg.RMSNormEps)
-	head.Hnorm = loadNorm(tensors, mtpPrefix+"pre_fc_norm_hidden.weight", shiftNorms, cfg.RMSNormEps)
-	head.FC = linears.Make(mtpPrefix + "fc")
-	head.Norm = loadNorm(tensors, mtpPrefix+"norm.weight", shiftNorms, cfg.RMSNormEps)
+	head.Enorm = loadNorm(tensors, prefix+"pre_fc_norm_embedding.weight", shiftNorms, cfg.RMSNormEps)
+	head.Hnorm = loadNorm(tensors, prefix+"pre_fc_norm_hidden.weight", shiftNorms, cfg.RMSNormEps)
+	head.FC = linears.Make(prefix + "fc")
+	head.Norm = loadNorm(tensors, prefix+"norm.weight", shiftNorms, cfg.RMSNormEps)
 	if head.Enorm == nil || head.Hnorm == nil || head.FC == nil || head.Norm == nil {
-		return fmt.Errorf("mtp head: missing enorm/hnorm/fc/norm tensors")
+		return nil, fmt.Errorf("mtp head: missing enorm/hnorm/fc/norm tensors")
 	}
 
-	layer, err := loadLayer(linears, tensors, cfg, mtpPrefix+"layers.0", false, cfg.NumExperts > 0, useQuantizedExperts, shiftNorms)
+	layer, err := loadLayer(linears, tensors, cfg, prefix+"layers.0", false, cfg.NumExperts > 0, useQuantizedExperts, shiftNorms)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	head.Layer = layer
-
-	m.MTP = head
-	return nil
+	return head, nil
 }
 
 func (a *FullAttention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config, mropeCos, mropeSin *mlx.Array) *mlx.Array {
@@ -1433,6 +1433,11 @@ func (m *Model) SelfDraft() model.DraftModel {
 // Forward runs one MTP step; the head's hidden also serves as the aux
 // hidden seeding the next step.
 func (m *mtpDraft) Forward(b *batch.Batch, _, draftCaches []cache.Cache) (hidden, auxHidden *mlx.Array) {
+	return (*Model)(m).forwardMTP(m.MTP, b, draftCaches[0])
+}
+
+// forwardMTP runs one step of an MTP head through the model's embedding.
+func (m *Model) forwardMTP(head *MTPHead, b *batch.Batch, c cache.Cache) (hidden, auxHidden *mlx.Array) {
 	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	positions := mlx.FromValues(b.SeqOffsets, len(b.SeqOffsets))
@@ -1441,19 +1446,19 @@ func (m *mtpDraft) Forward(b *batch.Batch, _, draftCaches []cache.Cache) (hidden
 	if len(b.Media) > 0 {
 		// The pair at slot S embeds the look-ahead token S+1, so each row's
 		// column 0 holds the prompt token one past its offset.
-		raw = (*Model)(m).scatterMedia(raw, b, 1)
+		raw = m.scatterMedia(raw, b, 1)
 	}
-	emb := m.MTP.Enorm.Forward(raw, m.RMSNormEps)
-	h := m.MTP.Hnorm.Forward(b.Hidden, m.RMSNormEps)
-	fused := m.MTP.FC.Forward(emb.Concatenate(-1, h))
+	emb := head.Enorm.Forward(raw, m.RMSNormEps)
+	h := head.Hnorm.Forward(b.Hidden, m.RMSNormEps)
+	fused := head.FC.Forward(emb.Concatenate(-1, h))
 
 	var mropeCos, mropeSin *mlx.Array
 	if mp := ropePositions(b, L); mp != nil {
 		mropeCos, mropeSin = mropeCosSin(m.Config, mp, L)
 	}
 
-	out := m.MTP.Layer.Forward(fused, b, draftCaches[0], positions, B, L, m.Config, mropeCos, mropeSin)
-	hidden = m.MTP.Norm.Forward(out, m.RMSNormEps)
+	out := head.Layer.Forward(fused, b, c, positions, B, L, m.Config, mropeCos, mropeSin)
+	hidden = head.Norm.Forward(out, m.RMSNormEps)
 	return hidden, hidden
 }
 

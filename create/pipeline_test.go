@@ -151,6 +151,48 @@ func TestCreatePipelineIncludesDraftLayers(t *testing.T) {
 	}
 }
 
+// An mlx-vlm qwen3_5_mtp drafter (the mtp/ folder of a Ternary Bonsai 2 pack)
+// names only a model_type and omits its quantization mode; its own 4-bit
+// metadata must survive next to a target quantized differently.
+func TestCreatePipelineImportsQwen35MTPDraft(t *testing.T) {
+	modelDir := t.TempDir()
+	writeConfigJSON(t, modelDir, `{"architectures":["Qwen3_5ForCausalLM"]}`)
+	createTestSafetensors(t, filepath.Join(modelDir, "model.safetensors"), []*st.TensorData{
+		st.NewTensorDataFromBytes("model.norm.weight", "BF16", []int32{8}, make([]byte, 16)),
+	})
+	draftDir := t.TempDir()
+	writeConfigJSON(t, draftDir, `{"model_type":"qwen3_5_mtp","text_config":{"model_type":"qwen3_5_text"},"quantization":{"group_size":64,"bits":4}}`)
+	createTestSafetensors(t, filepath.Join(draftDir, "model.safetensors"), []*st.TensorData{
+		// 512 inputs at 4 bits pack into 64 words, in 8 groups of 64.
+		st.NewTensorDataFromBytes("fc.weight", "U32", []int32{4, 64}, make([]byte, 4*64*4)),
+		st.NewTensorDataFromBytes("fc.scales", "F16", []int32{4, 8}, make([]byte, 4*8*2)),
+		st.NewTensorDataFromBytes("fc.biases", "F16", []int32{4, 8}, make([]byte, 4*8*2)),
+		st.NewTensorDataFromBytes("norm.weight", "F16", []int32{8}, make([]byte, 16)),
+	})
+
+	store := newCaptureStore()
+	opts := testPipelineOptions()
+	opts.DraftDir = draftDir
+	err := Create(context.Background(), "mymodel", modelDir, opts, store, func(context.Context, string, ManifestInfo) error {
+		return nil
+	}, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc, ok := store.blobs["draft.fc.weight"]
+	if !ok {
+		t.Fatalf("missing draft.fc.weight blob; blobs = %v", store.names())
+	}
+	if md := blobMetadata(t, fc); md["quant_type"] != "int4" || md["group_size"] != "64" {
+		t.Errorf("draft fc metadata = %v, want quant_type=int4 group_size=64", md)
+	}
+	for _, name := range []string{"draft.norm.weight", "draft/config.json"} {
+		if _, ok := store.blobs[name]; !ok {
+			t.Errorf("missing %s; blobs = %v", name, store.names())
+		}
+	}
+}
+
 func TestCreatePipelineReportsPrequantizedFileType(t *testing.T) {
 	dir := t.TempDir()
 	writeConfigJSON(t, dir, `{"architectures":["TestModel"],"dtype":"bfloat16"}`)

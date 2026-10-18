@@ -36,6 +36,13 @@ func TestValidateMLXModelFallsBackToModelType(t *testing.T) {
 	}
 }
 
+func TestValidateMLXDraftAcceptsQwen35MTP(t *testing.T) {
+	err := validateMLXSource(sourceModelConfig{ModelType: "qwen3_5_mtp"}, true, MLXValidationOptions{})
+	if errors.Is(err, ErrUnsupportedMLXArchitecture) {
+		t.Fatalf("validateMLXSource() error = %v, want qwen3_5_mtp drafts supported", err)
+	}
+}
+
 func TestValidateMLXDraftIgnoresTextConfigFallback(t *testing.T) {
 	cfg := sourceModelConfig{}
 	cfg.TextConfig.ModelType = "DFlashDraftModel"
