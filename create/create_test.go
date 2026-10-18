@@ -586,9 +586,8 @@ func TestGetTensorQuantization_MixedPrecisionPromotion(t *testing.T) {
 	}
 }
 
-// mlx-lm writes per-module entries next to the default. Without a mode, a
-// config whose entries differ from the default records nothing, so the loader
-// infers each weight from its shapes.
+// QuantMetadata records the config's default whatever its per-module entries
+// say; matchPrequant gives each weight its own entry.
 func TestQuantMetadataModuleEntries(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -598,16 +597,7 @@ func TestQuantMetadataModuleEntries(t *testing.T) {
 	}{
 		{"entry restating the default", `{"group_size": 32, "bits": 4, "model.layers.0.self_attn.v_proj": {"group_size": 32, "bits": 4, "mode": "affine"}}`, "int4", "32"},
 		{"modules without entries", `{"group_size": 32, "bits": 4, "lm_head": false, "model.embed_tokens": null, "model.layers.0.mlp.gate": {}, "model.layers.0.mlp.up_proj": true}`, "int4", "32"},
-		{"entry at another width", `{"group_size": 32, "bits": 4, "model.layers.0.self_attn.v_proj": {"group_size": 64, "bits": 8}}`, "", ""},
-		// MLX fills in an entry's omitted fields from the mode, not the config.
-		{"entry at MLX's group size", `{"group_size": 32, "bits": 4, "model.layers.0.mlp.gate": {"bits": 4}}`, "", ""},
-		{"entry at MLX's width", `{"group_size": 64, "bits": 8, "model.layers.0.mlp.gate": {"group_size": 64}}`, "", ""},
-		{"entry with null fields", `{"group_size": 64, "bits": 8, "model.layers.0.mlp.gate": {"bits": null}}`, "", ""},
-		{"entry in another mode", `{"group_size": 32, "bits": 4, "model.layers.0.mlp.gate": {"mode": "mxfp4"}}`, "", ""},
-		{"entry at an unsupported width", `{"group_size": 64, "bits": 4, "model.layers.0.mlp.down_proj": {"group_size": 64, "bits": 6}}`, "", ""},
-		{"unreadable entry", `{"group_size": 64, "bits": 4, "model.layers.0.mlp.down_proj": {"bits": "8"}}`, "", ""},
-		// Configs that state a mode still record the default, pending support
-		// for per-module entries.
+		{"entry at another width", `{"group_size": 32, "bits": 4, "model.layers.0.self_attn.v_proj": {"group_size": 64, "bits": 8}}`, "int4", "32"},
 		{"mode stated", `{"group_size": 32, "bits": 4, "mode": "affine", "model.layers.0.self_attn.v_proj": {"group_size": 64, "bits": 8}}`, "int4", "32"},
 	}
 	for _, tt := range tests {
