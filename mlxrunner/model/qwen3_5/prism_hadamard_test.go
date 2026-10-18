@@ -162,8 +162,9 @@ func TestPrismHadamardLoadWeights(t *testing.T) {
 			t.Fatalf("LoadWeights: %v", err)
 		}
 
-		if _, ok := m.EmbedTokens.(*nn.HadamardEmbedding); !ok {
-			t.Errorf("embedding is %T, want *nn.HadamardEmbedding", m.EmbedTokens)
+		embedding, ok := m.EmbedTokens.(*nn.HadamardEmbedding)
+		if !ok {
+			t.Fatalf("embedding is %T, want *nn.HadamardEmbedding", m.EmbedTokens)
 		}
 		if _, ok := m.LMHead.(*nn.HadamardLinear); !ok {
 			t.Errorf("tied head is %T, want *nn.HadamardLinear", m.LMHead)
@@ -177,8 +178,35 @@ func TestPrismHadamardLoadWeights(t *testing.T) {
 		if ba, ok := gdn.InProjBA.(*nn.Linear); !ok || ba.Weight.DType() != mlx.DTypeFloat16 {
 			t.Errorf("in_proj_ba = %T, want a float16 *nn.Linear", gdn.InProjBA)
 		}
-		if _, ok := m.Layers[1].FullAttn.QProj.(*nn.HadamardLinear); !ok {
-			t.Errorf("q_proj is %T, want *nn.HadamardLinear", m.Layers[1].FullAttn.QProj)
+		// Projections reading the same input rotate it once, at the layer;
+		// down_proj reads the MLP's own activations and keeps its rotation.
+		attn := m.Layers[1].FullAttn
+		if attn.InputRotation == nil {
+			t.Error("attention has no shared input rotation")
+		}
+		for name, proj := range map[string]nn.LinearLayer{"q_proj": attn.QProj, "k_proj": attn.KProj, "v_proj": attn.VProj} {
+			if _, ok := proj.(*nn.QuantizedLinear); !ok {
+				t.Errorf("%s is %T, want *nn.QuantizedLinear under the shared rotation", name, proj)
+			}
+		}
+		if _, ok := attn.OProj.(*nn.HadamardLinear); !ok {
+			t.Errorf("o_proj is %T, want *nn.HadamardLinear", attn.OProj)
+		}
+		for i, layer := range m.Layers {
+			mlp, ok := layer.MLP.(*DenseMLP)
+			if !ok {
+				t.Fatalf("layer %d MLP is %T, want *DenseMLP", i, layer.MLP)
+			}
+			if mlp.InputRotation == nil {
+				t.Errorf("layer %d MLP has no shared input rotation", i)
+			}
+			if _, ok := mlp.DownProj.(*nn.HadamardLinear); !ok {
+				t.Errorf("layer %d down_proj is %T, want *nn.HadamardLinear", i, mlp.DownProj)
+			}
+		}
+		// Every input width has one rotation, shared by its modules.
+		if embedding.Rotation != attn.InputRotation {
+			t.Error("the embedding and attention rotations of the same width are distinct")
 		}
 
 		// Activations run in the pack's float16; the decay keeps float32.
@@ -200,6 +228,68 @@ func TestPrismHadamardLoadWeights(t *testing.T) {
 		if got := m.Norm.Weight.AsType(mlx.DTypeFloat32).Floats()[0]; got != 1 {
 			t.Errorf("final norm weight[0] = %v, want 1 (no +1 shift)", got)
 		}
+	})
+}
+
+// Projections whose rotations differ keep their own: only projections sharing
+// one rotation may rotate their common input once.
+func TestPrismHadamardKeepsDistinctRotations(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		p := newPrismPack()
+		for _, proj := range []string{"model.layers.1.self_attn.k_proj", "model.layers.0.mlp.up_proj"} {
+			name := "language_model." + proj + ".signs"
+			p.tensors[name] = mlx.Neg(p.tensors[name])
+		}
+		m := p.model()
+		if err := m.LoadWeights(p.tensors); err != nil {
+			t.Fatalf("LoadWeights: %v", err)
+		}
+
+		attn := m.Layers[1].FullAttn
+		q, qRotated := attn.QProj.(*nn.HadamardLinear)
+		k, kRotated := attn.KProj.(*nn.HadamardLinear)
+		switch {
+		case attn.InputRotation != nil:
+			t.Error("attention shares one rotation although k_proj's differs")
+		case !qRotated || !kRotated:
+			t.Errorf("q_proj, k_proj = %T, %T, want each to keep its rotation", attn.QProj, attn.KProj)
+		case q.Rotation == k.Rotation:
+			t.Error("q_proj and k_proj share a rotation although their signs differ")
+		}
+
+		mlp0, ok0 := m.Layers[0].MLP.(*DenseMLP)
+		mlp1, ok1 := m.Layers[1].MLP.(*DenseMLP)
+		if !ok0 || !ok1 {
+			t.Fatalf("MLPs are %T, %T, want *DenseMLP", m.Layers[0].MLP, m.Layers[1].MLP)
+		}
+		if _, ok := mlp0.UpProj.(*nn.HadamardLinear); !ok || mlp0.InputRotation != nil {
+			t.Errorf("layer 0 MLP: up_proj = %T, shared rotation = %v; want up_proj to keep its own", mlp0.UpProj, mlp0.InputRotation != nil)
+		}
+		if mlp1.InputRotation == nil {
+			t.Error("layer 1 MLP, whose gate and up match, lost its shared rotation")
+		}
+	})
+}
+
+// A hoisted rotation computes the same MLP as rotating inside each projection.
+func TestDenseMLPSharedRotationMatchesPerProjection(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		const width, hidden = 512, 512
+		rotation := &nn.Hadamard{Signs: prismSigns(width), Block: 512}
+		down := &nn.Hadamard{Signs: prismSigns(hidden), Block: 512}
+		quantized := func(rows, cols int) nn.LinearLayer {
+			return nn.NewQuantizedLinear(patternArray(rows, cols).AsType(mlx.DTypeFloat16), nil, 128, 2, "affine")
+		}
+		gate, up, downProj := quantized(hidden, width), quantized(hidden, width), quantized(width, hidden)
+		x := patternArray(3, width).AsType(mlx.DTypeFloat16)
+
+		shared := &DenseMLP{GateProj: gate, UpProj: up, DownProj: &nn.HadamardLinear{Inner: downProj, Rotation: down}, InputRotation: rotation}
+		perProjection := &DenseMLP{
+			GateProj: &nn.HadamardLinear{Inner: gate, Rotation: rotation},
+			UpProj:   &nn.HadamardLinear{Inner: up, Rotation: rotation},
+			DownProj: &nn.HadamardLinear{Inner: downProj, Rotation: down},
+		}
+		assertBitEqual(t, "mlp", shared.Forward(x, nil), perProjection.Forward(x, nil))
 	})
 }
 

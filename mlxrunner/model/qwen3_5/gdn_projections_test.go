@@ -129,15 +129,14 @@ func TestConcatProjectionPairRotated(t *testing.T) {
 			}
 			return mlx.FromValues(values, in)
 		}
-		// Equal signs in distinct arrays, as every module of a pack ships its own.
+		// The loader gives modules with equal signs one rotation instance.
 		rotation := &nn.Hadamard{Signs: signs(32), Block: 32}
-		sameSigns := &nn.Hadamard{Signs: signs(32), Block: 32}
 		otherSigns := &nn.Hadamard{Signs: signs(in), Block: 32}
 		rotated := func(rows int, r *nn.Hadamard) *nn.HadamardLinear {
 			return &nn.HadamardLinear{Inner: nn.NewQuantizedLinear(patternArray(rows, in).AsType(mlx.DTypeFloat32), nil, 32, 4, "affine"), Rotation: r}
 		}
 
-		hi, lo := rotated(16, rotation), rotated(8, sameSigns)
+		hi, lo := rotated(16, rotation), rotated(8, rotation)
 		packed, err := concatProjectionPair(hi, lo)
 		if err != nil {
 			t.Fatal(err)

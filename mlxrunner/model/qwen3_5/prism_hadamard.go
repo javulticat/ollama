@@ -3,6 +3,7 @@ package qwen3_5
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/ollama/ollama/mlx"
@@ -106,6 +107,14 @@ func (m *Model) hadamardRotations(tensors map[string]*mlx.Array, layout tensorPa
 	cfg := m.Config
 	embedPath := layout.modelPrefix + "embed_tokens"
 	rotations := make(map[string]*nn.Hadamard)
+	// Bonsai 2 packs give every module of an input width the same signs.
+	// Deduplicating rotations by value lets projections of the same input
+	// rotate it once.
+	type knownRotation struct {
+		rotation *nn.Hadamard
+		signs    []float32
+	}
+	var known []knownRotation
 	for _, mod := range m.hadamardModules {
 		path := layout.containerPrefix + mod.Path
 		weight, scales, signs := tensors[path+".weight"], tensors[path+".weight_scale"], tensors[path+".signs"]
@@ -131,12 +140,20 @@ func (m *Model) hadamardRotations(tensors map[string]*mlx.Array, layout tensorPa
 		if signs.NumDims() != 1 || signs.Dim(0) != width || width%mod.Block != 0 {
 			return nil, fmt.Errorf("packed module %s: Hadamard signs %v do not fit input width %d with block %d", mod.Path, signs.Dims(), width, mod.Block)
 		}
-		for _, v := range signs.AsType(mlx.DTypeFloat32).Floats() {
+		values := signs.AsType(mlx.DTypeFloat32).Floats()
+		for _, v := range values {
 			if v != 1 && v != -1 {
 				return nil, fmt.Errorf("packed module %s: Hadamard signs must be -1 or +1, found %v", mod.Path, v)
 			}
 		}
-		rotations[path] = &nn.Hadamard{Signs: signs, Block: mod.Block}
+		i := slices.IndexFunc(known, func(k knownRotation) bool {
+			return k.rotation.Block == mod.Block && slices.Equal(k.signs, values)
+		})
+		if i < 0 {
+			known = append(known, knownRotation{&nn.Hadamard{Signs: signs, Block: mod.Block}, values})
+			i = len(known) - 1
+		}
+		rotations[path] = known[i].rotation
 	}
 
 	for name := range tensors {
@@ -189,6 +206,41 @@ func (r *rotatingLinears) embedding(layer nn.EmbeddingLayer, path string) nn.Emb
 		return &nn.HadamardEmbedding{Inner: layer, Rotation: rotation}
 	}
 	return layer
+}
+
+// shareInputRotations hoists the rotation out of projections that read the
+// same input with the same rotation, so a layer rotates that input once
+// rather than once per projection: attention's q, k and v, and the MLP's
+// gate and up.
+func shareInputRotations(layers []*Layer) {
+	for _, layer := range layers {
+		if attn := layer.FullAttn; attn != nil {
+			if rotation, inner, ok := commonRotation(attn.QProj, attn.KProj, attn.VProj); ok {
+				attn.InputRotation = rotation
+				attn.QProj, attn.KProj, attn.VProj = inner[0], inner[1], inner[2]
+			}
+		}
+		if mlp, ok := layer.MLP.(*DenseMLP); ok {
+			if rotation, inner, ok := commonRotation(mlp.GateProj, mlp.UpProj); ok {
+				mlp.InputRotation = rotation
+				mlp.GateProj, mlp.UpProj = inner[0], inner[1]
+			}
+		}
+	}
+}
+
+// commonRotation returns the rotation every layer applies to its input and
+// the layers' unrotated projections, or ok=false unless all share one.
+func commonRotation(layers ...nn.LinearLayer) (rotation *nn.Hadamard, inner []nn.LinearLayer, ok bool) {
+	inner = make([]nn.LinearLayer, len(layers))
+	for i, layer := range layers {
+		rotated, isRotated := layer.(*nn.HadamardLinear)
+		if !isRotated || (rotation != nil && rotated.Rotation != rotation) {
+			return nil, nil, false
+		}
+		rotation, inner[i] = rotated.Rotation, rotated.Inner
+	}
+	return rotation, inner, true
 }
 
 // checkApplied reports a rotated module the model never built, which would

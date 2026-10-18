@@ -3,7 +3,6 @@ package qwen3_5
 import (
 	"fmt"
 	"log/slog"
-	"slices"
 
 	"github.com/ollama/ollama/mlx"
 	"github.com/ollama/ollama/mlxrunner/nn"
@@ -120,8 +119,9 @@ func concatProjectionPair(hi, lo nn.LinearLayer) (nn.LinearLayer, error) {
 	loR, loRotated := lo.(*nn.HadamardLinear)
 	if hiRotated || loRotated {
 		// Rows from the two projections can share one matmul only if both
-		// rotate their common input the same way.
-		if !hiRotated || !loRotated || !sameRotation(hiR.Rotation, loR.Rotation) {
+		// rotate their common input the same way. The loader gives equal
+		// rotations one instance, so comparing instances suffices.
+		if !hiRotated || !loRotated || hiR.Rotation != loR.Rotation {
 			return nil, fmt.Errorf("linear attention projections disagree on their input rotation")
 		}
 		inner, err := concatProjectionPair(hiR.Inner, loR.Inner)
@@ -171,16 +171,6 @@ func concatQuantizedPair(hi, lo *nn.QuantizedLinear) (nn.LinearLayer, error) {
 		Bits:        hi.Bits,
 		Mode:        hi.Mode,
 	}, nil
-}
-
-func sameRotation(a, b *nn.Hadamard) bool {
-	if a == b {
-		return true
-	}
-	return a.Block == b.Block && slices.Equal(
-		a.Signs.AsType(mlx.DTypeFloat32).Floats(),
-		b.Signs.AsType(mlx.DTypeFloat32).Floats(),
-	)
 }
 
 func denseProjection(layer nn.LinearLayer) (*nn.Linear, error) {

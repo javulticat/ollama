@@ -157,6 +157,10 @@ type FullAttention struct {
 
 	QNorm *nn.RMSNorm
 	KNorm *nn.RMSNorm
+
+	// InputRotation, when set, rotates the input once for q, k and v, whose
+	// weights share it (Prism Hadamard packs).
+	InputRotation *nn.Hadamard
 }
 
 // GatedDeltaNet is the recurrent linear-attention branch.
@@ -182,6 +186,10 @@ type DenseMLP struct {
 	GateProj nn.LinearLayer
 	UpProj   nn.LinearLayer
 	DownProj nn.LinearLayer
+
+	// InputRotation, when set, rotates the input once for gate and up, whose
+	// weights share it (Prism Hadamard packs).
+	InputRotation *nn.Hadamard
 }
 
 // SparseMoE is Qwen3.5's sparse MoE with shared expert.
@@ -1021,6 +1029,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		if err := rotated.checkApplied(); err != nil {
 			return err
 		}
+		shareInputRotations(m.Layers)
 	}
 
 	return m.loadVisionWeights(tensors, factory)
@@ -1170,6 +1179,9 @@ func loadMTPHead(linears linearMaker, tensors map[string]*mlx.Array, cfg *Config
 }
 
 func (a *FullAttention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config, mropeCos, mropeSin *mlx.Array) *mlx.Array {
+	if a.InputRotation != nil {
+		x = a.InputRotation.Forward(x)
+	}
 	qg := a.QProj.Forward(x)
 	qg = mlx.Reshape(qg, B, L, cfg.NumAttentionHeads, cfg.HeadDim*2)
 	q := mlx.SliceStartStop(qg, []int32{0, 0, 0, 0}, []int32{B, L, cfg.NumAttentionHeads, cfg.HeadDim})
@@ -1262,6 +1274,9 @@ func (g *GatedDeltaNet) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, B, 
 }
 
 func (m *DenseMLP) Forward(x *mlx.Array, _ *Config) *mlx.Array {
+	if m.InputRotation != nil {
+		x = m.InputRotation.Forward(x)
+	}
 	return m.DownProj.Forward(nn.SwiGLU(m.GateProj, m.UpProj, x))
 }
 
