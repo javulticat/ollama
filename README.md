@@ -8,6 +8,51 @@
 
 Start building with open models. Access the latest releases locally or in the cloud with complete privacy.
 
+## About this fork
+
+This fork is Ollama with an expanded MLX engine. It imports and runs more kinds of MLX-quantized safetensors checkpoints, including Prism ML's Bonsai models, and runs some of them faster.
+
+The installers under [Download](#download) install upstream Ollama. To use this fork, check out its `mlx` branch and [build from source](docs/development.md). It's tested on Apple Silicon.
+
+### What it adds
+
+**Importing MLX checkpoints**
+
+- Weights at every MLX affine bit width: 1, 2, 3, 4, 5, 6 and 8.
+- Mixed-precision checkpoints, which give some layers their own quantization in `config.json`, such as mlx-lm's mixed recipes and its AWQ output. Each layer imports at its own width.
+- Configs that omit the quantization `mode`, as older mlx-lm releases write, such as `Qwen/Qwen3-8B-MLX-4bit`.
+- Configs that give a `model_type` but no `architectures` list.
+
+**Models**
+
+- Prism ML's Ternary Bonsai 2, including its vision tower and its MTP drafter for speculative decoding.
+- YaRN rope scaling for Qwen3 models, which Prism ML's Bonsai 1.7B models and Qwen3's long-context configurations use.
+- Qwen 3.5 vision checkpoints converted by mlx-vlm, which store the patch embedding channels-last.
+
+**Speed**
+
+- The fused linear-attention kernels run for float16 activations on Metal, as Ternary Bonsai 2 uses.
+- Ternary Bonsai 2's Hadamard rotations are compiled, and run once for inputs that several projections share.
+
+### Tested models
+
+On an M1 Pro, greedy output from these imports matches mlx-lm 0.32.2 token for token over 48 tokens:
+
+- [`prism-ml/Bonsai-1.7B-mlx-1bit`](https://huggingface.co/prism-ml/Bonsai-1.7B-mlx-1bit) and [`prism-ml/Ternary-Bonsai-1.7B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-mlx-2bit)
+- Qwen3-0.6B at 3 and 6 bits, mlx-lm's `mixed_3_6` recipe, and checkpoints that omit the `mode`
+
+[`prism-ml/Ternary-Bonsai-2-4B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-mlx-2bit) matches mlx-vlm over 64 tokens and decodes at about 68 tokens/s. To use its MTP drafter, point `DRAFT` at the pack's `mtp` folder:
+
+```
+FROM /path/to/Ternary-Bonsai-2-4B-mlx-2bit
+DRAFT /path/to/Ternary-Bonsai-2-4B-mlx-2bit/mtp
+```
+
+### Limits
+
+- 1-bit weights don't run on NVIDIA GPUs, since MLX has no 1-bit CUDA kernels.
+- In mixture-of-experts models other than Gemma 4, affine-quantized experts must be 4- or 8-bit; other widths are refused at import.
+
 ## Download
 
 ### macOS
